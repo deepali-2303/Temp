@@ -1,0 +1,731 @@
+#!/usr/bin/env python3
+"""
+ws — Personal Workspace CLI
+Friction-free capture for doubts, notes, tasks, and any custom label.
+"""
+
+import sys
+import json
+import os
+import re
+from datetime import datetime, date
+from pathlib import Path
+
+# ── Config ───────────────────────────────────────────────────────────────────
+DATA_DIR = Path(os.environ.get("WS_DATA_DIR", Path.home() / ".workspace"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+CONFIG_FILE = DATA_DIR / "_config.json"
+EXPORT_DIR  = DATA_DIR / "exports"
+
+# ── Defaults (overridden by config) ──────────────────────────────────────────
+DEFAULT_LABELS = {
+    "doubt": {"color": "yellow",  "icon": "?", "plural": "doubts"},
+    "note":  {"color": "cyan",    "icon": "#", "plural": "notes"},
+    "task":  {"color": "green",   "icon": "*", "plural": "tasks"},
+}
+
+AVAILABLE_COLORS = ["red", "green", "yellow", "blue", "magenta", "cyan", "white"]
+
+COLORS = {
+    "reset":   "\033[0m",
+    "bold":    "\033[1m",
+    "dim":     "\033[2m",
+    "red":     "\033[91m",
+    "green":   "\033[92m",
+    "yellow":  "\033[93m",
+    "blue":    "\033[94m",
+    "magenta": "\033[95m",
+    "cyan":    "\033[96m",
+    "white":   "\033[97m",
+}
+
+def c(text, *styles):
+    codes = "".join(COLORS.get(s, "") for s in styles)
+    return f"{codes}{text}{COLORS['reset']}"
+
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+def today_str():
+    return date.today().isoformat()
+
+# ── Config load/save ──────────────────────────────────────────────────────────
+def load_config():
+    if not CONFIG_FILE.exists():
+        return {"labels": dict(DEFAULT_LABELS)}
+    with open(CONFIG_FILE) as f:
+        cfg = json.load(f)
+    for k, v in DEFAULT_LABELS.items():
+        cfg["labels"].setdefault(k, v)
+    return cfg
+
+def save_config(cfg):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+def get_labels():
+    return load_config()["labels"]
+
+def label_file(label):
+    return DATA_DIR / f"{label}s.json"
+
+def resolve_label(raw):
+    """Accept singular, plural, or prefix. Returns canonical label or None."""
+    labels = get_labels()
+    raw = raw.lower().strip()
+    if raw in labels:
+        return raw
+    for k, v in labels.items():
+        if raw == v.get("plural", k + "s"):
+            return k
+    matches = [k for k in labels if k.startswith(raw)]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+def load(label):
+    path = label_file(label)
+    if not path.exists():
+        return []
+    with open(path) as f:
+        return json.load(f)
+
+def save_entries(label, items):
+    with open(label_file(label), "w") as f:
+        json.dump(items, f, indent=2)
+
+# ── Display helpers ───────────────────────────────────────────────────────────
+def label_color(label):
+    return get_labels().get(label, {}).get("color", "white")
+
+def label_icon(label):
+    return get_labels().get(label, {}).get("icon", ".")
+
+def print_entry(item, label, highlight=None):
+    col  = label_color(label)
+    icon = label_icon(label)
+    idx  = c(f"  [{item['id']:>3}]", "dim")
+
+    text = item["text"]
+    if highlight:
+        pattern = re.compile(re.escape(highlight), re.IGNORECASE)
+        text = pattern.sub(lambda m: c(m.group(), "bold", "white"), text)
+
+    status = c("v", "green") if item["resolved"] else c(icon, col)
+    text_c = c(text, "dim") if item["resolved"] and not highlight else c(text, "white")
+
+    tags_s = ""
+    if item.get("tags"):
+        tags_s = "  " + "  ".join(c(f"#{t}", "magenta") for t in item["tags"])
+
+    print(f"{idx} {status}  {text_c}{tags_s}")
+    print(c(f"       created {item['created']}", "dim"))
+
+    if item.get("resolved") and item.get("comment"):
+        print(c(f"       -> {item['comment']}", "green"))
+        print(c(f"          resolved {item['resolved_at']}", "dim"))
+
+    if item.get("edited_at"):
+        print(c(f"          edited   {item['edited_at']}", "dim"))
+
+    print()
+
+# ── cmd: ADD ──────────────────────────────────────────────────────────────────
+def cmd_add(label, text):
+    items = load(label)
+    col   = label_color(label)
+    icon  = label_icon(label)
+
+    found_tags = re.findall(r"#(\w+)", text)
+    text_clean = re.sub(r"\s*#\w+", "", text).strip() if found_tags else text.strip()
+
+    entry = {
+        "id":           len(items) + 1,
+        "text":         text_clean,
+        "tags":         found_tags,
+        "created":      now_str(),
+        "created_date": today_str(),
+        "resolved":     False,
+        "comment":      None,
+        "resolved_at":  None,
+        "edited_at":    None,
+    }
+    items.append(entry)
+    save_entries(label, items)
+
+    print(c(f"\n  [{icon}] {label.upper()} #{entry['id']} saved", col, "bold"))
+    print(c(f"      {entry['text']}", "white"))
+    if found_tags:
+        print(c("      " + "  ".join(f"#{t}" for t in found_tags), "magenta"))
+    print(c(f"      {entry['created']}\n", "dim"))
+
+# ── cmd: LIST ─────────────────────────────────────────────────────────────────
+def cmd_list(label, show_resolved=False, tag_filter=None):
+    items = load(label)
+    col   = label_color(label)
+
+    if tag_filter:
+        items = [i for i in items if tag_filter in (i.get("tags") or [])]
+
+    visible        = [i for i in items if show_resolved or not i["resolved"]]
+    resolved_count = sum(1 for i in items if i["resolved"])
+
+    if not visible:
+        if items:
+            print(c(f"\n  All {label}s resolved ({resolved_count} total). Use --all to see them.\n", "dim"))
+        else:
+            print(c(f"\n  No {label}s yet. Add one:  ws {label.upper()}: your {label}\n", "dim"))
+        return
+
+    header = f"  {label.upper()}S"
+    if not show_resolved and resolved_count:
+        header += c(f"  ({resolved_count} resolved -- ws list {label}s --all)", "dim")
+
+    print()
+    print(c(header, col, "bold"))
+    print(c("  " + "-" * 54, "dim"))
+    for item in visible:
+        print_entry(item, label)
+
+# ── cmd: SEARCH ───────────────────────────────────────────────────────────────
+def cmd_search(keyword, label_filter=None):
+    labels   = get_labels()
+    targets  = {label_filter: labels[label_filter]} if label_filter else labels
+    kw_lower = keyword.lower()
+    found    = 0
+
+    print()
+    print(c(f'  SEARCH  "{keyword}"', "white", "bold"))
+    print(c("  " + "-" * 54, "dim"))
+
+    for label in targets:
+        items = load(label)
+        col   = label_color(label)
+        hits  = [
+            i for i in items
+            if kw_lower in i["text"].lower()
+            or any(kw_lower in t.lower() for t in (i.get("tags") or []))
+            or kw_lower in (i.get("comment") or "").lower()
+        ]
+        if not hits:
+            continue
+        print(c(f"\n  {label.upper()}S  ({len(hits)} match{'es' if len(hits)>1 else ''})", col, "bold"))
+        for item in hits:
+            print_entry(item, label, highlight=keyword)
+            found += 1
+
+    if not found:
+        print(c(f'\n  No results for "{keyword}"\n', "dim"))
+    else:
+        print(c(f"  {found} result{'s' if found>1 else ''} found\n", "dim"))
+
+# ── cmd: RESOLVE ──────────────────────────────────────────────────────────────
+def cmd_resolve(label):
+    items      = load(label)
+    col        = label_color(label)
+    icon       = label_icon(label)
+    open_items = [i for i in items if not i["resolved"]]
+
+    if not open_items:
+        print(c(f"\n  No open {label}s to resolve.\n", "dim"))
+        return
+
+    print()
+    print(c(f"  OPEN {label.upper()}S", col, "bold"))
+    print(c("  " + "-" * 54, "dim"))
+    for item in open_items:
+        print(c(f"  [{item['id']:>3}]", "dim") + f"  {c(icon, col)}  {c(item['text'], 'white')}")
+        if item.get("tags"):
+            print(c("        " + "  ".join(f"#{t}" for t in item["tags"]), "magenta"))
+        print(c(f"        {item['created']}", "dim"))
+        print()
+
+    try:
+        raw = input(c("  Enter ID to resolve: ", "bold")).strip()
+        idx = int(raw)
+    except (ValueError, EOFError):
+        print(c("\n  Cancelled.\n", "dim"))
+        return
+
+    match = next((i for i in items if i["id"] == idx), None)
+    if not match:
+        print(c(f"\n  No {label} with ID {idx}.\n", "red"))
+        return
+    if match["resolved"]:
+        print(c(f"\n  #{idx} is already resolved.\n", "dim"))
+        return
+
+    print(c(f"\n  {label.upper()} #{idx}: ", "dim") + c(match["text"], "white"))
+    try:
+        comment = input(c("  Resolution / comment (Enter to skip): ", "bold")).strip()
+    except EOFError:
+        print(c("\n  Cancelled.\n", "dim"))
+        return
+
+    match["resolved"]    = True
+    match["comment"]     = comment or None
+    match["resolved_at"] = now_str()
+    save_entries(label, items)
+    print(c(f"\n  [v] {label.upper()} #{idx} resolved.\n", "green", "bold"))
+
+# ── cmd: EDIT ─────────────────────────────────────────────────────────────────
+def cmd_edit(label):
+    items = load(label)
+    col   = label_color(label)
+    icon  = label_icon(label)
+
+    if not items:
+        print(c(f"\n  No {label}s found.\n", "dim"))
+        return
+
+    print()
+    print(c(f"  {label.upper()}S -- pick one to edit", col, "bold"))
+    print(c("  " + "-" * 54, "dim"))
+    for item in items:
+        status = c("v", "green") if item["resolved"] else c(icon, col)
+        print(c(f"  [{item['id']:>3}]", "dim") + f"  {status}  {c(item['text'], 'white')}")
+    print()
+
+    try:
+        raw = input(c("  Enter ID to edit: ", "bold")).strip()
+        idx = int(raw)
+    except (ValueError, EOFError):
+        print(c("\n  Cancelled.\n", "dim"))
+        return
+
+    match = next((i for i in items if i["id"] == idx), None)
+    if not match:
+        print(c(f"\n  No {label} with ID {idx}.\n", "red"))
+        return
+
+    print(c(f"\n  Current: ", "dim") + c(match["text"], "white"))
+    print(c("  (Enter new text, or press Enter to keep as-is)", "dim"))
+    try:
+        new_text = input(c("  New text: ", "bold")).strip()
+    except EOFError:
+        print(c("\n  Cancelled.\n", "dim"))
+        return
+
+    if new_text:
+        found_tags = re.findall(r"#(\w+)", new_text)
+        text_clean = re.sub(r"\s*#\w+", "", new_text).strip() if found_tags else new_text
+        match["text"]      = text_clean
+        if found_tags:
+            match["tags"]  = found_tags
+        match["edited_at"] = now_str()
+        save_entries(label, items)
+        print(c(f"\n  [v] {label.upper()} #{idx} updated.\n", "green"))
+    else:
+        print(c("\n  No changes made.\n", "dim"))
+
+# ── cmd: DELETE ───────────────────────────────────────────────────────────────
+def cmd_delete(label):
+    items = load(label)
+    col   = label_color(label)
+    icon  = label_icon(label)
+
+    if not items:
+        print(c(f"\n  No {label}s found.\n", "dim"))
+        return
+
+    print()
+    print(c(f"  {label.upper()}S", col, "bold"))
+    print(c("  " + "-" * 54, "dim"))
+    for item in items:
+        status = c("v", "green") if item["resolved"] else c(icon, col)
+        print(c(f"  [{item['id']:>3}]", "dim") + f"  {status}  {c(item['text'], 'white')}")
+    print()
+
+    try:
+        raw = input(c("  Enter ID to delete: ", "bold")).strip()
+        idx = int(raw)
+    except (ValueError, EOFError):
+        print(c("\n  Cancelled.\n", "dim"))
+        return
+
+    match = next((i for i in items if i["id"] == idx), None)
+    if not match:
+        print(c(f"\n  No {label} with ID {idx}.\n", "red"))
+        return
+
+    preview = (match["text"][:60] + "...") if len(match["text"]) > 60 else match["text"]
+    confirm = input(c(f'  Delete "{preview}"? (y/N): ', "yellow")).strip().lower()
+    if confirm != "y":
+        print(c("\n  Cancelled.\n", "dim"))
+        return
+
+    items = [i for i in items if i["id"] != idx]
+    save_entries(label, items)
+    print(c(f"\n  Deleted {label} #{idx}.\n", "red"))
+
+# ── cmd: EXPORT ───────────────────────────────────────────────────────────────
+def cmd_export(fmt="md", label_filter=None):
+    EXPORT_DIR.mkdir(exist_ok=True)
+    labels  = get_labels()
+    targets = {label_filter: labels[label_filter]} if label_filter else labels
+    ts      = datetime.now().strftime("%Y-%m-%d_%H%M")
+
+    if fmt == "md":
+        lines = [f"# Workspace Export", f"", f"*Generated: {now_str()}*", ""]
+        for label in targets:
+            items = load(label)
+            if not items:
+                continue
+            lines.append(f"## {label.upper()}S")
+            lines.append("")
+            open_    = [i for i in items if not i["resolved"]]
+            resolved = [i for i in items if i["resolved"]]
+            if open_:
+                lines.append("### Open")
+                lines.append("")
+                for i in open_:
+                    tags = ("  " + " ".join(f"`#{t}`" for t in i["tags"])) if i.get("tags") else ""
+                    lines.append(f"- **[{i['id']}]** {i['text']}{tags}  _{i['created']}_")
+                lines.append("")
+            if resolved:
+                lines.append("### Resolved")
+                lines.append("")
+                for i in resolved:
+                    res = f" -- {i['comment']}" if i.get("comment") else ""
+                    lines.append(f"- ~~[{i['id']}] {i['text']}~~{res}  _{i['resolved_at']}_")
+                lines.append("")
+        out = EXPORT_DIR / f"workspace_{ts}.md"
+        out.write_text("\n".join(lines), encoding="utf-8")
+
+    elif fmt == "json":
+        data = {}
+        for label in targets:
+            data[label] = load(label)
+        out = EXPORT_DIR / f"workspace_{ts}.json"
+        out.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    elif fmt == "txt":
+        lines = [f"WORKSPACE EXPORT -- {now_str()}", "=" * 60, ""]
+        for label in targets:
+            items = load(label)
+            if not items:
+                continue
+            lines += [f"{label.upper()}S", "-" * 40]
+            for i in items:
+                status = "[v]" if i["resolved"] else "[ ]"
+                lines.append(f"  {status} [{i['id']}] {i['text']}")
+                if i.get("comment"):
+                    lines.append(f"       -> {i['comment']}")
+            lines.append("")
+        out = EXPORT_DIR / f"workspace_{ts}.txt"
+        out.write_text("\n".join(lines), encoding="utf-8")
+
+    print(c(f"\n  [v] Exported to:\n    {out}\n", "green"))
+
+# ── cmd: STATS ────────────────────────────────────────────────────────────────
+def cmd_stats():
+    labels     = get_labels()
+    total_open = total_done = 0
+    today      = today_str()
+
+    print()
+    print(c("  WORKSPACE STATS", "white", "bold"))
+    print(c("  " + "-" * 54, "dim"))
+
+    for label, meta in labels.items():
+        items        = load(label)
+        open_        = [i for i in items if not i["resolved"]]
+        done         = [i for i in items if i["resolved"]]
+        added_today  = [i for i in items if i.get("created_date") == today]
+        closed_today = [i for i in done if (i.get("resolved_at") or "")[:10] == today]
+        col          = meta["color"]
+        icon         = meta["icon"]
+
+        total_open += len(open_)
+        total_done += len(done)
+
+        pct        = len(done) / max(len(items), 1)
+        bar_filled = int(pct * 20)
+        bar        = c("#" * bar_filled, col) + c("." * (20 - bar_filled), "dim")
+
+        print(f"\n  {c(f'[{icon}] {label.upper()}S', col, 'bold')}")
+        print(f"  [{bar}]  {c(str(len(done)), 'green')}/{c(str(len(items)), 'white')} resolved  ({int(pct*100)}%)")
+        print(c(f"  Added today: {len(added_today)}   Closed today: {len(closed_today)}", "dim"))
+
+        if open_:
+            latest  = open_[-1]
+            preview = (latest["text"][:55] + "...") if len(latest["text"]) > 55 else latest["text"]
+            print(c(f"  Latest open: {preview}", "dim"))
+
+    print()
+    print(c(f"  TOTAL  {total_open} open  .  {total_done} resolved", "white", "bold"))
+    print()
+
+# ── cmd: SUMMARY (dashboard) ──────────────────────────────────────────────────
+def cmd_summary():
+    labels = get_labels()
+    today  = today_str()
+    print()
+    print(c("  WORKSPACE", "white", "bold"))
+    print(c(f"  {today}", "dim"))
+    print(c("  " + "-" * 40, "dim"))
+
+    for label, meta in labels.items():
+        items  = load(label)
+        open_  = sum(1 for i in items if not i["resolved"])
+        done   = sum(1 for i in items if i["resolved"])
+        col    = meta["color"]
+        icon   = meta["icon"]
+        open_s = c(str(open_), col if open_ else "dim")
+        done_s = c(str(done), "dim")
+        print(f"  {c(f'[{icon}]', col)}  {c((label.upper() + 'S'), col, 'bold'):<18}  {open_s} open  {done_s} done")
+
+    print()
+    print(c("  ws help   for all commands", "dim"))
+    print()
+
+# ── cmd: LABEL MANAGEMENT ─────────────────────────────────────────────────────
+def cmd_label(args):
+    cfg    = load_config()
+    labels = cfg["labels"]
+
+    if not args or args[0] in ("list", "ls"):
+        print()
+        print(c("  LABELS", "white", "bold"))
+        print(c("  " + "-" * 40, "dim"))
+        for name, meta in labels.items():
+            col  = meta.get("color", "white")
+            icon = meta.get("icon", ".")
+            built = c("  (built-in)", "dim") if name in DEFAULT_LABELS else ""
+            print(f"  {c(f'[{icon}]', col)}  {c(name.upper(), col, 'bold')}{built}")
+            print(c(f"       color: {col}   file: {name}s.json", "dim"))
+        print()
+        print(c(f"  Add:    ws label add <name> [color] [icon]", "dim"))
+        print(c(f"  Colors: {', '.join(AVAILABLE_COLORS)}", "dim"))
+        print(c(f"  Remove: ws label remove <name>", "dim"))
+        print()
+        return
+
+    subcmd = args[0].lower()
+
+    if subcmd == "add":
+        if len(args) < 2:
+            print(c("\n  Usage: ws label add <name> [color] [icon]\n", "dim"))
+            print(c(f"  Colors: {', '.join(AVAILABLE_COLORS)}\n", "dim"))
+            return
+        name  = args[1].lower().rstrip("s")
+        color = args[2] if len(args) > 2 else "white"
+        icon  = args[3] if len(args) > 3 else name[0].upper()
+
+        if color not in AVAILABLE_COLORS:
+            print(c(f"\n  Unknown color '{color}'. Choose: {', '.join(AVAILABLE_COLORS)}\n", "red"))
+            return
+        if name in labels:
+            print(c(f"\n  Label '{name}' already exists.\n", "yellow"))
+            return
+
+        labels[name] = {"color": color, "icon": icon, "plural": name + "s"}
+        save_config(cfg)
+        print(c(f"\n  [v] Label '{name.upper()}' added  [{icon}] in {color}\n", color, "bold"))
+        print(c(f"  Use it:  ws {name.upper()}: your text\n", "dim"))
+        return
+
+    if subcmd in ("remove", "rm", "delete"):
+        if len(args) < 2:
+            print(c("\n  Usage: ws label remove <name>\n", "dim"))
+            return
+        name = args[1].lower().rstrip("s")
+        if name in DEFAULT_LABELS:
+            print(c(f"\n  Cannot remove built-in label '{name}'.\n", "red"))
+            return
+        if name not in labels:
+            print(c(f"\n  Label '{name}' not found.\n", "red"))
+            return
+        confirm = input(c(f"  Remove label '{name}'? Data file is kept. (y/N): ", "yellow")).strip().lower()
+        if confirm != "y":
+            print(c("\n  Cancelled.\n", "dim"))
+            return
+        del labels[name]
+        save_config(cfg)
+        print(c(f"\n  Label '{name}' removed.\n", "dim"))
+        return
+
+    print(c(f"\n  Unknown subcommand '{subcmd}'. Use: list, add, remove\n", "red"))
+
+# ── cmd: HELP ─────────────────────────────────────────────────────────────────
+def cmd_help():
+    print(c("""
+  ws -- Workspace CLI
+  =====================================================
+
+  ADD  (tags via #hashtag in text)
+    ws DOUBT: why does prod throw 403?
+    ws TASK: write tests for auth #backend
+    ws NOTE: check nginx config #devops #infra
+
+  LIST
+    ws list doubts              open items only
+    ws list doubts --all        include resolved
+    ws list tasks #backend      filter by tag
+    ws doubts                   shortcut for list
+
+  SEARCH  (searches text + tags + comments)
+    ws search nginx             search everywhere
+    ws search nginx doubt       search only in doubts
+
+  RESOLVE / EDIT / DELETE
+    ws resolve doubt            interactive resolve + comment
+    ws edit doubt               edit entry text or tags
+    ws delete task              remove an entry
+
+  EXPORT
+    ws export                   markdown (default)
+    ws export json              full JSON dump
+    ws export txt               plain text
+    ws export md doubt          export only doubts
+
+  LABELS  (add your own)
+    ws label list               show all labels
+    ws label add bug red !      add BUG label (red, icon !)
+    ws label add idea magenta i
+    ws label remove bug
+
+  STATS / SUMMARY
+    ws stats                    progress bars + today's counts
+    ws                          quick dashboard
+
+  =====================================================
+""", "dim"))
+    print(c(f"  Data dir:    {DATA_DIR}", "dim"))
+    print(c(f"  Export dir:  {EXPORT_DIR}", "dim"))
+    print(c(f"  Config:      {CONFIG_FILE}\n", "dim"))
+
+# ── Router ────────────────────────────────────────────────────────────────────
+def main():
+    args = sys.argv[1:]
+
+    if not args:
+        cmd_summary()
+        return
+
+    labels = get_labels()
+
+    # ── ADD: detect "LABEL: text ..."
+    joined = " ".join(args)
+    for label in labels:
+        prefix = label.upper() + ":"
+        if joined.upper().startswith(prefix):
+            text = joined[len(prefix):].strip()
+            if not text:
+                print(c(f"\n  Usage: ws {prefix} your text here\n", "dim"))
+                return
+            cmd_add(label, text)
+            return
+
+    first = args[0].lower()
+    rest  = args[1:]
+
+    # HELP
+    if first in ("help", "--help", "-h"):
+        cmd_help()
+        return
+
+    # SUMMARY
+    if first in ("summary", "status", "s"):
+        cmd_summary()
+        return
+
+    # STATS
+    if first in ("stats", "stat"):
+        cmd_stats()
+        return
+
+    # LIST
+    if first in ("list", "ls", "l"):
+        if not rest:
+            cmd_summary()
+            return
+        label = resolve_label(rest[0])
+        if not label:
+            print(c(f"\n  Unknown label '{rest[0]}'.\n", "red"))
+            return
+        show_all   = "--all" in rest
+        tag_filter = next((a[1:] for a in rest if a.startswith("#")), None)
+        cmd_list(label, show_resolved=show_all, tag_filter=tag_filter)
+        return
+
+    # SEARCH
+    if first in ("search", "find", "grep", "f"):
+        if not rest:
+            print(c("\n  Usage: ws search <keyword> [label]\n", "dim"))
+            return
+        keyword      = rest[0]
+        label_filter = resolve_label(rest[1]) if len(rest) > 1 else None
+        cmd_search(keyword, label_filter)
+        return
+
+    # RESOLVE
+    if first in ("resolve", "done", "close", "r"):
+        if not rest:
+            print(c("\n  Usage: ws resolve <label>\n", "dim"))
+            return
+        label = resolve_label(rest[0])
+        if not label:
+            print(c(f"\n  Unknown label '{rest[0]}'.\n", "red"))
+            return
+        cmd_resolve(label)
+        return
+
+    # EDIT
+    if first in ("edit", "e", "update"):
+        if not rest:
+            print(c("\n  Usage: ws edit <label>\n", "dim"))
+            return
+        label = resolve_label(rest[0])
+        if not label:
+            print(c(f"\n  Unknown label '{rest[0]}'.\n", "red"))
+            return
+        cmd_edit(label)
+        return
+
+    # DELETE
+    if first in ("delete", "del", "rm"):
+        if not rest:
+            print(c("\n  Usage: ws delete <label>\n", "dim"))
+            return
+        label = resolve_label(rest[0])
+        if not label:
+            print(c(f"\n  Unknown label '{rest[0]}'.\n", "red"))
+            return
+        cmd_delete(label)
+        return
+
+    # EXPORT
+    if first in ("export", "exp", "x"):
+        fmt          = "md"
+        label_filter = None
+        for arg in rest:
+            if arg in ("md", "json", "txt"):
+                fmt = arg
+            else:
+                lf = resolve_label(arg)
+                if lf:
+                    label_filter = lf
+        cmd_export(fmt, label_filter)
+        return
+
+    # LABEL management
+    if first in ("label", "labels"):
+        cmd_label(rest)
+        return
+
+    # Shortcut: "ws doubts" -> list
+    label = resolve_label(first)
+    if label:
+        show_all   = "--all" in rest
+        tag_filter = next((a[1:] for a in rest if a.startswith("#")), None)
+        cmd_list(label, show_resolved=show_all, tag_filter=tag_filter)
+        return
+
+    print(c(f"\n  Unknown command '{args[0]}'. Run 'ws help' for usage.\n", "red"))
+
+
+if __name__ == "__main__":
+    main()
