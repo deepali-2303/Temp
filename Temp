@@ -8,6 +8,7 @@ import sys
 import json
 import os
 import re
+import subprocess
 from datetime import datetime, date
 from pathlib import Path
 
@@ -16,39 +17,43 @@ DATA_DIR = Path(os.environ.get("WS_DATA_DIR", Path.home() / ".workspace"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 CONFIG_FILE = DATA_DIR / "_config.json"
-EXPORT_DIR  = DATA_DIR / "exports"
+EXPORT_DIR = DATA_DIR / "exports"
 
 # ── Defaults (overridden by config) ──────────────────────────────────────────
 DEFAULT_LABELS = {
-    "doubt": {"color": "yellow",  "icon": "?", "plural": "doubts"},
-    "note":  {"color": "cyan",    "icon": "#", "plural": "notes"},
-    "task":  {"color": "green",   "icon": "*", "plural": "tasks"},
+    "doubt": {"color": "yellow", "icon": "?", "plural": "doubts"},
+    "note": {"color": "cyan", "icon": "#", "plural": "notes"},
+    "task": {"color": "green", "icon": "*", "plural": "tasks"},
 }
 
 AVAILABLE_COLORS = ["red", "green", "yellow", "blue", "magenta", "cyan", "white"]
 
 COLORS = {
-    "reset":   "\033[0m",
-    "bold":    "\033[1m",
-    "dim":     "\033[2m",
-    "red":     "\033[91m",
-    "green":   "\033[92m",
-    "yellow":  "\033[93m",
-    "blue":    "\033[94m",
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "red": "\033[91m",
+    "green": "\033[92m",
+    "yellow": "\033[93m",
+    "blue": "\033[94m",
     "magenta": "\033[95m",
-    "cyan":    "\033[96m",
-    "white":   "\033[97m",
+    "cyan": "\033[96m",
+    "white": "\033[97m",
 }
+
 
 def c(text, *styles):
     codes = "".join(COLORS.get(s, "") for s in styles)
     return f"{codes}{text}{COLORS['reset']}"
 
+
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M")
 
+
 def today_str():
     return date.today().isoformat()
+
 
 # ── Config load/save ──────────────────────────────────────────────────────────
 def load_config():
@@ -60,15 +65,19 @@ def load_config():
         cfg["labels"].setdefault(k, v)
     return cfg
 
+
 def save_config(cfg):
     with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
 
+
 def get_labels():
     return load_config()["labels"]
 
+
 def label_file(label):
     return DATA_DIR / f"{label}s.json"
+
 
 def resolve_label(raw):
     """Accept singular, plural, or prefix. Returns canonical label or None."""
@@ -84,6 +93,7 @@ def resolve_label(raw):
         return matches[0]
     return None
 
+
 # ── Storage ───────────────────────────────────────────────────────────────────
 def load(label):
     path = label_file(label)
@@ -92,21 +102,126 @@ def load(label):
     with open(path) as f:
         return json.load(f)
 
+
 def save_entries(label, items):
     with open(label_file(label), "w") as f:
         json.dump(items, f, indent=2)
+
+
+# ── Files per-label support (open / append shortcuts)
+FILES_DIR = DATA_DIR / "files"
+
+
+def _safe_filename(name: str) -> str:
+    name = name.strip()
+    name = re.sub(r"[^A-Za-z0-9_ \-]", "_", name)
+    return name.replace(" ", "_")
+
+
+def file_for_label_doc(label: str, name: str):
+    d = FILES_DIR / f"{label}_files"
+    d.mkdir(parents=True, exist_ok=True)
+    fname = _safe_filename(name)
+    if not fname:
+        fname = "untitled"
+    return d / f"{fname}.md"
+
+
+def cmd_append_file(label: str, name: str, text: str):
+    path = file_for_label_doc(label, name)
+    header = f"# {name}\n\n"
+    created = now_str()
+    line = f"- {created}  {text}\n"
+    if not path.exists():
+        path.write_text(header + line, encoding="utf-8")
+        print(c(f"\n  [v] Created and appended to {path}\n", "green"))
+    else:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+        print(c(f"\n  [v] Appended to {path}\n", "green"))
+
+
+def cmd_open_file(label: str, name: str):
+    import shutil
+    import webbrowser
+
+    path = file_for_label_doc(label, name)
+    # create file if missing (so user can open & edit a fresh note)
+    if not path.exists():
+        header = f"# {name}\n\n"
+        path.write_text(header, encoding="utf-8")
+        print(c(f"\n  [v] Created file: {path}\n", "green"))
+
+    editor = os.environ.get("WS_EDITOR") or os.environ.get("EDITOR")
+    try:
+        if editor:
+            parts = editor.split()
+            exe = shutil.which(parts[0])
+            if not exe:
+                print(
+                    c(
+                        f"\n  Editor '{parts[0]}' not found. Set WS_EDITOR to a valid editor.\n",
+                        "dim",
+                    )
+                )
+                return
+            cmd = parts + [str(path)]
+            subprocess.run(cmd)
+            return
+        # platform open commands only if available
+        # Try the platform default opener; if it exists but fails (no handler), try VS Code.
+        if sys.platform.startswith("linux") and shutil.which("xdg-open"):
+            cp = subprocess.run(["xdg-open", str(path)], check=False)
+            if cp.returncode == 0:
+                return
+            # xdg-open failed (common when no default app). Try VS Code next.
+            code_bin = shutil.which("code") or shutil.which("code-insiders")
+            if code_bin:
+                subprocess.run([code_bin, str(path)])
+                return
+        if sys.platform == "darwin" and shutil.which("open"):
+            cp = subprocess.run(["open", str(path)], check=False)
+            if cp.returncode == 0:
+                return
+            code_bin = shutil.which("code") or shutil.which("code-insiders")
+            if code_bin:
+                subprocess.run([code_bin, str(path)])
+                return
+        if sys.platform.startswith("win"):
+            try:
+                os.startfile(str(path))
+                return
+            except Exception:
+                code_bin = shutil.which("code") or shutil.which("code-insiders")
+                if code_bin:
+                    subprocess.run([code_bin, str(path)])
+                    return
+
+        # Try VS Code directly if available (generic fallback)
+        code_bin = shutil.which("code") or shutil.which("code-insiders")
+        if code_bin:
+            subprocess.run([code_bin, str(path)])
+            return
+
+        # last-resort: open in default browser (works cross-platform)
+        webbrowser.open(path.as_uri())
+    except Exception as e:
+        print(c(f"\n  Failed to open file: {e}\n", "red"))
+
 
 # ── Display helpers ───────────────────────────────────────────────────────────
 def label_color(label):
     return get_labels().get(label, {}).get("color", "white")
 
+
 def label_icon(label):
     return get_labels().get(label, {}).get("icon", ".")
 
+
 def print_entry(item, label, highlight=None):
-    col  = label_color(label)
+    col = label_color(label)
     icon = label_icon(label)
-    idx  = c(f"  [{item['id']:>3}]", "dim")
+    idx = c(f"  [{item['id']:>3}]", "dim")
 
     text = item["text"]
     if highlight:
@@ -132,25 +247,26 @@ def print_entry(item, label, highlight=None):
 
     print()
 
+
 # ── cmd: ADD ──────────────────────────────────────────────────────────────────
 def cmd_add(label, text):
     items = load(label)
-    col   = label_color(label)
-    icon  = label_icon(label)
+    col = label_color(label)
+    icon = label_icon(label)
 
     found_tags = re.findall(r"#(\w+)", text)
     text_clean = re.sub(r"\s*#\w+", "", text).strip() if found_tags else text.strip()
 
     entry = {
-        "id":           len(items) + 1,
-        "text":         text_clean,
-        "tags":         found_tags,
-        "created":      now_str(),
+        "id": len(items) + 1,
+        "text": text_clean,
+        "tags": found_tags,
+        "created": now_str(),
         "created_date": today_str(),
-        "resolved":     False,
-        "comment":      None,
-        "resolved_at":  None,
-        "edited_at":    None,
+        "resolved": False,
+        "comment": None,
+        "resolved_at": None,
+        "edited_at": None,
     }
     items.append(entry)
     save_entries(label, items)
@@ -161,22 +277,33 @@ def cmd_add(label, text):
         print(c("      " + "  ".join(f"#{t}" for t in found_tags), "magenta"))
     print(c(f"      {entry['created']}\n", "dim"))
 
+
 # ── cmd: LIST ─────────────────────────────────────────────────────────────────
 def cmd_list(label, show_resolved=False, tag_filter=None):
     items = load(label)
-    col   = label_color(label)
+    col = label_color(label)
 
     if tag_filter:
         items = [i for i in items if tag_filter in (i.get("tags") or [])]
 
-    visible        = [i for i in items if show_resolved or not i["resolved"]]
+    visible = [i for i in items if show_resolved or not i["resolved"]]
     resolved_count = sum(1 for i in items if i["resolved"])
 
     if not visible:
         if items:
-            print(c(f"\n  All {label}s resolved ({resolved_count} total). Use --all to see them.\n", "dim"))
+            print(
+                c(
+                    f"\n  All {label}s resolved ({resolved_count} total). Use --all to see them.\n",
+                    "dim",
+                )
+            )
         else:
-            print(c(f"\n  No {label}s yet. Add one:  ws {label.upper()}: your {label}\n", "dim"))
+            print(
+                c(
+                    f"\n  No {label}s yet. Add one:  ws {label.upper()}: your {label}\n",
+                    "dim",
+                )
+            )
         return
 
     header = f"  {label.upper()}S"
@@ -189,12 +316,13 @@ def cmd_list(label, show_resolved=False, tag_filter=None):
     for item in visible:
         print_entry(item, label)
 
+
 # ── cmd: SEARCH ───────────────────────────────────────────────────────────────
 def cmd_search(keyword, label_filter=None):
-    labels   = get_labels()
-    targets  = {label_filter: labels[label_filter]} if label_filter else labels
+    labels = get_labels()
+    targets = {label_filter: labels[label_filter]} if label_filter else labels
     kw_lower = keyword.lower()
-    found    = 0
+    found = 0
 
     print()
     print(c(f'  SEARCH  "{keyword}"', "white", "bold"))
@@ -202,16 +330,23 @@ def cmd_search(keyword, label_filter=None):
 
     for label in targets:
         items = load(label)
-        col   = label_color(label)
-        hits  = [
-            i for i in items
+        col = label_color(label)
+        hits = [
+            i
+            for i in items
             if kw_lower in i["text"].lower()
             or any(kw_lower in t.lower() for t in (i.get("tags") or []))
             or kw_lower in (i.get("comment") or "").lower()
         ]
         if not hits:
             continue
-        print(c(f"\n  {label.upper()}S  ({len(hits)} match{'es' if len(hits)>1 else ''})", col, "bold"))
+        print(
+            c(
+                f"\n  {label.upper()}S  ({len(hits)} match{'es' if len(hits) > 1 else ''})",
+                col,
+                "bold",
+            )
+        )
         for item in hits:
             print_entry(item, label, highlight=keyword)
             found += 1
@@ -219,13 +354,14 @@ def cmd_search(keyword, label_filter=None):
     if not found:
         print(c(f'\n  No results for "{keyword}"\n', "dim"))
     else:
-        print(c(f"  {found} result{'s' if found>1 else ''} found\n", "dim"))
+        print(c(f"  {found} result{'s' if found > 1 else ''} found\n", "dim"))
+
 
 # ── cmd: RESOLVE ──────────────────────────────────────────────────────────────
 def cmd_resolve(label):
-    items      = load(label)
-    col        = label_color(label)
-    icon       = label_icon(label)
+    items = load(label)
+    col = label_color(label)
+    icon = label_icon(label)
     open_items = [i for i in items if not i["resolved"]]
 
     if not open_items:
@@ -236,7 +372,10 @@ def cmd_resolve(label):
     print(c(f"  OPEN {label.upper()}S", col, "bold"))
     print(c("  " + "-" * 54, "dim"))
     for item in open_items:
-        print(c(f"  [{item['id']:>3}]", "dim") + f"  {c(icon, col)}  {c(item['text'], 'white')}")
+        print(
+            c(f"  [{item['id']:>3}]", "dim")
+            + f"  {c(icon, col)}  {c(item['text'], 'white')}"
+        )
         if item.get("tags"):
             print(c("        " + "  ".join(f"#{t}" for t in item["tags"]), "magenta"))
         print(c(f"        {item['created']}", "dim"))
@@ -264,17 +403,18 @@ def cmd_resolve(label):
         print(c("\n  Cancelled.\n", "dim"))
         return
 
-    match["resolved"]    = True
-    match["comment"]     = comment or None
+    match["resolved"] = True
+    match["comment"] = comment or None
     match["resolved_at"] = now_str()
     save_entries(label, items)
     print(c(f"\n  [v] {label.upper()} #{idx} resolved.\n", "green", "bold"))
 
+
 # ── cmd: EDIT ─────────────────────────────────────────────────────────────────
 def cmd_edit(label):
     items = load(label)
-    col   = label_color(label)
-    icon  = label_icon(label)
+    col = label_color(label)
+    icon = label_icon(label)
 
     if not items:
         print(c(f"\n  No {label}s found.\n", "dim"))
@@ -285,7 +425,9 @@ def cmd_edit(label):
     print(c("  " + "-" * 54, "dim"))
     for item in items:
         status = c("v", "green") if item["resolved"] else c(icon, col)
-        print(c(f"  [{item['id']:>3}]", "dim") + f"  {status}  {c(item['text'], 'white')}")
+        print(
+            c(f"  [{item['id']:>3}]", "dim") + f"  {status}  {c(item['text'], 'white')}"
+        )
     print()
 
     try:
@@ -310,21 +452,24 @@ def cmd_edit(label):
 
     if new_text:
         found_tags = re.findall(r"#(\w+)", new_text)
-        text_clean = re.sub(r"\s*#\w+", "", new_text).strip() if found_tags else new_text
-        match["text"]      = text_clean
+        text_clean = (
+            re.sub(r"\s*#\w+", "", new_text).strip() if found_tags else new_text
+        )
+        match["text"] = text_clean
         if found_tags:
-            match["tags"]  = found_tags
+            match["tags"] = found_tags
         match["edited_at"] = now_str()
         save_entries(label, items)
         print(c(f"\n  [v] {label.upper()} #{idx} updated.\n", "green"))
     else:
         print(c("\n  No changes made.\n", "dim"))
 
+
 # ── cmd: DELETE ───────────────────────────────────────────────────────────────
 def cmd_delete(label):
     items = load(label)
-    col   = label_color(label)
-    icon  = label_icon(label)
+    col = label_color(label)
+    icon = label_icon(label)
 
     if not items:
         print(c(f"\n  No {label}s found.\n", "dim"))
@@ -335,7 +480,9 @@ def cmd_delete(label):
     print(c("  " + "-" * 54, "dim"))
     for item in items:
         status = c("v", "green") if item["resolved"] else c(icon, col)
-        print(c(f"  [{item['id']:>3}]", "dim") + f"  {status}  {c(item['text'], 'white')}")
+        print(
+            c(f"  [{item['id']:>3}]", "dim") + f"  {status}  {c(item['text'], 'white')}"
+        )
     print()
 
     try:
@@ -360,12 +507,13 @@ def cmd_delete(label):
     save_entries(label, items)
     print(c(f"\n  Deleted {label} #{idx}.\n", "red"))
 
+
 # ── cmd: EXPORT ───────────────────────────────────────────────────────────────
 def cmd_export(fmt="md", label_filter=None):
     EXPORT_DIR.mkdir(exist_ok=True)
-    labels  = get_labels()
+    labels = get_labels()
     targets = {label_filter: labels[label_filter]} if label_filter else labels
-    ts      = datetime.now().strftime("%Y-%m-%d_%H%M")
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M")
 
     if fmt == "md":
         lines = [f"# Workspace Export", f"", f"*Generated: {now_str()}*", ""]
@@ -375,21 +523,29 @@ def cmd_export(fmt="md", label_filter=None):
                 continue
             lines.append(f"## {label.upper()}S")
             lines.append("")
-            open_    = [i for i in items if not i["resolved"]]
+            open_ = [i for i in items if not i["resolved"]]
             resolved = [i for i in items if i["resolved"]]
             if open_:
                 lines.append("### Open")
                 lines.append("")
                 for i in open_:
-                    tags = ("  " + " ".join(f"`#{t}`" for t in i["tags"])) if i.get("tags") else ""
-                    lines.append(f"- **[{i['id']}]** {i['text']}{tags}  _{i['created']}_")
+                    tags = (
+                        ("  " + " ".join(f"`#{t}`" for t in i["tags"]))
+                        if i.get("tags")
+                        else ""
+                    )
+                    lines.append(
+                        f"- **[{i['id']}]** {i['text']}{tags}  _{i['created']}_"
+                    )
                 lines.append("")
             if resolved:
                 lines.append("### Resolved")
                 lines.append("")
                 for i in resolved:
                     res = f" -- {i['comment']}" if i.get("comment") else ""
-                    lines.append(f"- ~~[{i['id']}] {i['text']}~~{res}  _{i['resolved_at']}_")
+                    lines.append(
+                        f"- ~~[{i['id']}] {i['text']}~~{res}  _{i['resolved_at']}_"
+                    )
                 lines.append("")
         out = EXPORT_DIR / f"workspace_{ts}.md"
         out.write_text("\n".join(lines), encoding="utf-8")
@@ -419,71 +575,87 @@ def cmd_export(fmt="md", label_filter=None):
 
     print(c(f"\n  [v] Exported to:\n    {out}\n", "green"))
 
+
 # ── cmd: STATS ────────────────────────────────────────────────────────────────
 def cmd_stats():
-    labels     = get_labels()
+    labels = get_labels()
     total_open = total_done = 0
-    today      = today_str()
+    today = today_str()
 
     print()
     print(c("  WORKSPACE STATS", "white", "bold"))
     print(c("  " + "-" * 54, "dim"))
 
     for label, meta in labels.items():
-        items        = load(label)
-        open_        = [i for i in items if not i["resolved"]]
-        done         = [i for i in items if i["resolved"]]
-        added_today  = [i for i in items if i.get("created_date") == today]
+        items = load(label)
+        open_ = [i for i in items if not i["resolved"]]
+        done = [i for i in items if i["resolved"]]
+        added_today = [i for i in items if i.get("created_date") == today]
         closed_today = [i for i in done if (i.get("resolved_at") or "")[:10] == today]
-        col          = meta["color"]
-        icon         = meta["icon"]
+        col = meta["color"]
+        icon = meta["icon"]
 
         total_open += len(open_)
         total_done += len(done)
 
-        pct        = len(done) / max(len(items), 1)
+        pct = len(done) / max(len(items), 1)
         bar_filled = int(pct * 20)
-        bar        = c("#" * bar_filled, col) + c("." * (20 - bar_filled), "dim")
+        bar = c("#" * bar_filled, col) + c("." * (20 - bar_filled), "dim")
 
         print(f"\n  {c(f'[{icon}] {label.upper()}S', col, 'bold')}")
-        print(f"  [{bar}]  {c(str(len(done)), 'green')}/{c(str(len(items)), 'white')} resolved  ({int(pct*100)}%)")
-        print(c(f"  Added today: {len(added_today)}   Closed today: {len(closed_today)}", "dim"))
+        print(
+            f"  [{bar}]  {c(str(len(done)), 'green')}/{c(str(len(items)), 'white')} resolved  ({int(pct * 100)}%)"
+        )
+        print(
+            c(
+                f"  Added today: {len(added_today)}   Closed today: {len(closed_today)}",
+                "dim",
+            )
+        )
 
         if open_:
-            latest  = open_[-1]
-            preview = (latest["text"][:55] + "...") if len(latest["text"]) > 55 else latest["text"]
+            latest = open_[-1]
+            preview = (
+                (latest["text"][:55] + "...")
+                if len(latest["text"]) > 55
+                else latest["text"]
+            )
             print(c(f"  Latest open: {preview}", "dim"))
 
     print()
     print(c(f"  TOTAL  {total_open} open  .  {total_done} resolved", "white", "bold"))
     print()
 
+
 # ── cmd: SUMMARY (dashboard) ──────────────────────────────────────────────────
 def cmd_summary():
     labels = get_labels()
-    today  = today_str()
+    today = today_str()
     print()
     print(c("  WORKSPACE", "white", "bold"))
     print(c(f"  {today}", "dim"))
     print(c("  " + "-" * 40, "dim"))
 
     for label, meta in labels.items():
-        items  = load(label)
-        open_  = sum(1 for i in items if not i["resolved"])
-        done   = sum(1 for i in items if i["resolved"])
-        col    = meta["color"]
-        icon   = meta["icon"]
+        items = load(label)
+        open_ = sum(1 for i in items if not i["resolved"])
+        done = sum(1 for i in items if i["resolved"])
+        col = meta["color"]
+        icon = meta["icon"]
         open_s = c(str(open_), col if open_ else "dim")
         done_s = c(str(done), "dim")
-        print(f"  {c(f'[{icon}]', col)}  {c((label.upper() + 'S'), col, 'bold'):<18}  {open_s} open  {done_s} done")
+        print(
+            f"  {c(f'[{icon}]', col)}  {c((label.upper() + 'S'), col, 'bold'):<18}  {open_s} open  {done_s} done"
+        )
 
     print()
     print(c("  ws help   for all commands", "dim"))
     print()
 
+
 # ── cmd: LABEL MANAGEMENT ─────────────────────────────────────────────────────
 def cmd_label(args):
-    cfg    = load_config()
+    cfg = load_config()
     labels = cfg["labels"]
 
     if not args or args[0] in ("list", "ls"):
@@ -491,7 +663,7 @@ def cmd_label(args):
         print(c("  LABELS", "white", "bold"))
         print(c("  " + "-" * 40, "dim"))
         for name, meta in labels.items():
-            col  = meta.get("color", "white")
+            col = meta.get("color", "white")
             icon = meta.get("icon", ".")
             built = c("  (built-in)", "dim") if name in DEFAULT_LABELS else ""
             print(f"  {c(f'[{icon}]', col)}  {c(name.upper(), col, 'bold')}{built}")
@@ -510,12 +682,17 @@ def cmd_label(args):
             print(c("\n  Usage: ws label add <name> [color] [icon]\n", "dim"))
             print(c(f"  Colors: {', '.join(AVAILABLE_COLORS)}\n", "dim"))
             return
-        name  = args[1].lower().rstrip("s")
+        name = args[1].lower().rstrip("s")
         color = args[2] if len(args) > 2 else "white"
-        icon  = args[3] if len(args) > 3 else name[0].upper()
+        icon = args[3] if len(args) > 3 else name[0].upper()
 
         if color not in AVAILABLE_COLORS:
-            print(c(f"\n  Unknown color '{color}'. Choose: {', '.join(AVAILABLE_COLORS)}\n", "red"))
+            print(
+                c(
+                    f"\n  Unknown color '{color}'. Choose: {', '.join(AVAILABLE_COLORS)}\n",
+                    "red",
+                )
+            )
             return
         if name in labels:
             print(c(f"\n  Label '{name}' already exists.\n", "yellow"))
@@ -523,7 +700,13 @@ def cmd_label(args):
 
         labels[name] = {"color": color, "icon": icon, "plural": name + "s"}
         save_config(cfg)
-        print(c(f"\n  [v] Label '{name.upper()}' added  [{icon}] in {color}\n", color, "bold"))
+        print(
+            c(
+                f"\n  [v] Label '{name.upper()}' added  [{icon}] in {color}\n",
+                color,
+                "bold",
+            )
+        )
         print(c(f"  Use it:  ws {name.upper()}: your text\n", "dim"))
         return
 
@@ -538,7 +721,11 @@ def cmd_label(args):
         if name not in labels:
             print(c(f"\n  Label '{name}' not found.\n", "red"))
             return
-        confirm = input(c(f"  Remove label '{name}'? Data file is kept. (y/N): ", "yellow")).strip().lower()
+        confirm = (
+            input(c(f"  Remove label '{name}'? Data file is kept. (y/N): ", "yellow"))
+            .strip()
+            .lower()
+        )
         if confirm != "y":
             print(c("\n  Cancelled.\n", "dim"))
             return
@@ -549,9 +736,12 @@ def cmd_label(args):
 
     print(c(f"\n  Unknown subcommand '{subcmd}'. Use: list, add, remove\n", "red"))
 
+
 # ── cmd: HELP ─────────────────────────────────────────────────────────────────
 def cmd_help():
-    print(c("""
+    print(
+        c(
+            """
   ws -- Workspace CLI
   =====================================================
 
@@ -591,11 +781,19 @@ def cmd_help():
     ws stats                    progress bars + today's counts
     ws                          quick dashboard
 
+  SHORTCUT FILES
+    ws NOTE <name>: <text>       append <text> to a note file named <name>
+    ws NOTES open <name>         open the note file named <name> in $WS_EDITOR or system opener
+
   =====================================================
-""", "dim"))
+""",
+            "dim",
+        )
+    )
     print(c(f"  Data dir:    {DATA_DIR}", "dim"))
     print(c(f"  Export dir:  {EXPORT_DIR}", "dim"))
     print(c(f"  Config:      {CONFIG_FILE}\n", "dim"))
+
 
 # ── Router ────────────────────────────────────────────────────────────────────
 def main():
@@ -607,12 +805,31 @@ def main():
 
     labels = get_labels()
 
-    # ── ADD: detect "LABEL: text ..."
+    # Try: "LABEL name: text" -> append to per-label file
     joined = " ".join(args)
+    m = re.match(r"(?i)^(?P<label>\w+)\s+(?P<name>[^:]+):\s*(?P<text>.+)$", joined)
+    if m:
+        lbl = resolve_label(m.group("label"))
+        if lbl:
+            name = m.group("name").strip()
+            text = m.group("text").strip()
+            cmd_append_file(lbl, name, text)
+            return
+
+    # Try: "LABEL open name" -> open per-label file
+    m2 = re.match(r"(?i)^(?P<label>\w+)\s+open\s+(?P<name>.+)$", joined)
+    if m2:
+        lbl = resolve_label(m2.group("label"))
+        if lbl:
+            name = m2.group("name").strip()
+            cmd_open_file(lbl, name)
+            return
+
+    # ── ADD: detect "LABEL: text ..." (existing behavior)
     for label in labels:
         prefix = label.upper() + ":"
         if joined.upper().startswith(prefix):
-            text = joined[len(prefix):].strip()
+            text = joined[len(prefix) :].strip()
             if not text:
                 print(c(f"\n  Usage: ws {prefix} your text here\n", "dim"))
                 return
@@ -620,7 +837,7 @@ def main():
             return
 
     first = args[0].lower()
-    rest  = args[1:]
+    rest = args[1:]
 
     # HELP
     if first in ("help", "--help", "-h"):
@@ -646,7 +863,7 @@ def main():
         if not label:
             print(c(f"\n  Unknown label '{rest[0]}'.\n", "red"))
             return
-        show_all   = "--all" in rest
+        show_all = "--all" in rest
         tag_filter = next((a[1:] for a in rest if a.startswith("#")), None)
         cmd_list(label, show_resolved=show_all, tag_filter=tag_filter)
         return
@@ -656,7 +873,7 @@ def main():
         if not rest:
             print(c("\n  Usage: ws search <keyword> [label]\n", "dim"))
             return
-        keyword      = rest[0]
+        keyword = rest[0]
         label_filter = resolve_label(rest[1]) if len(rest) > 1 else None
         cmd_search(keyword, label_filter)
         return
@@ -699,7 +916,7 @@ def main():
 
     # EXPORT
     if first in ("export", "exp", "x"):
-        fmt          = "md"
+        fmt = "md"
         label_filter = None
         for arg in rest:
             if arg in ("md", "json", "txt"):
@@ -719,7 +936,7 @@ def main():
     # Shortcut: "ws doubts" -> list
     label = resolve_label(first)
     if label:
-        show_all   = "--all" in rest
+        show_all = "--all" in rest
         tag_filter = next((a[1:] for a in rest if a.startswith("#")), None)
         cmd_list(label, show_resolved=show_all, tag_filter=tag_filter)
         return
